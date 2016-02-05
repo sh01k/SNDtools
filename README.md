@@ -9,7 +9,7 @@ CLI sound processing tools written by C++.
 - [libsndfile](http://www.mega-nerd.com/libsndfile/)
 
 ## License
-[MIT](https://github.com/sh01k/SND_tools/blob/master/LICENSE)
+[MIT](https://github.com/sh01k/SNDtools/blob/master/LICENSE)
 
 ## Author
 [Shoichi Koyama](http://www.sh01.org/)
