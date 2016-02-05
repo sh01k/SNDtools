@@ -14,7 +14,7 @@ CLI basic sound processing tools written in C++. The binary files in `bin/` fold
 
 ### play_multifilter
 - playback a monaural wave file by multiple outputs with filtering  
-`play_multi_filter {-i/--input filename} {-f/--filter directory of filter files} [-o/output number of output channels]  [-a/--amp amplitude] [-h/--help]`
+`play_multi_filter {-i/--input filename} {-f/--filter directory of filter files} [-o/--output number of output channels]  [-a/--amp amplitude] [-h/--help]`
 
 ## Requirements
 - [boost](http://www.boost.org/)
