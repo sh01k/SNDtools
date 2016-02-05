@@ -1,7 +1,7 @@
 SNDtools
 ====
 ## Description
-CLI basic sound processing tools written in C++. The binary files in `bin` are complied with Mac OS 10.9.
+CLI basic sound processing tools written in C++. The binary files in `bin/` folder were complied with Mac OS 10.9.
 
 ## Usage
 ### play
