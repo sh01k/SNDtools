@@ -6,277 +6,337 @@
 #include <getopt.h>
 #include <sndfile.h>
 #include <portaudio.h>
+#include <boost/thread.hpp>
+#include <boost/bind.hpp>
 #include <boost/property_tree/ptree.hpp>
 #include <boost/property_tree/ini_parser.hpp>
+#include <boost/optional.hpp>
 
 #define SETTING_INI "setting.ini"
 #define FRAME_SIZE_MAX 4096
+#define NUM_BUFF 2
 
 using namespace std;
 
 void usage(void)
 {
-  printf("Usage: rec {-o/--output filename} {-s/--samplerate sampling rate}\n"
-	       "           [-c/--channels number of channels] [-a/--amp amplitude]\n"
-         "           [-h/--help]\n"
-	 );
+	printf("Usage: play {-i/--input filename} [-a/--amp amplitude] [-h/--help]\n");
 }
 
-typedef struct
+class playStream
 {
-    SNDFILE *fp_write;
-    SF_INFO *sf_info_write;
+private:
+	volatile bool w_end_flg;
+	volatile bool r_end_flg;
+	volatile int rpos;
+	volatile int wpos;
 
-    float *inbuff;
-    float *outbuff;
+	boost::mutex state_guard;
 
-}CONSOLEAUDIOINFO;
+public:
+	SNDFILE *fp_read;
+	SF_INFO *sf_info_read;
 
-int parecCallback(
-    const void *inputBuffer,
-    void *outputBuffer,
-    unsigned long framesPerBuffer,
-    const PaStreamCallbackTimeInfo* timeInfo,
-    PaStreamCallbackFlags statusFlags,
-    void *userData)
+	float amp;
+
+	float **streamBuff;
+	int nFrameLength;
+
+	playStream(SNDFILE *_fp_read, SF_INFO *_sf_info_read, int _nFrameLength, float **_streamBuff, float _amp){
+		fp_read = _fp_read;
+		sf_info_read = _sf_info_read;
+		nFrameLength = _nFrameLength;
+		streamBuff = _streamBuff;
+		amp = _amp;
+
+		w_end_flg = false;
+		r_end_flg = false;
+		rpos = 0;
+		wpos = NUM_BUFF - 1;
+	}
+
+	int readData(){
+		int i;
+		sf_count_t count;
+
+		if (fp_read){
+			count = sf_read_float(fp_read, streamBuff[wpos], nFrameLength*sf_info_read->channels);
+
+			/* Change Amplitude */
+			for (i = 0; i<count; i++)
+				streamBuff[wpos][i] = amp*streamBuff[wpos][i];
+
+			if (count != nFrameLength*sf_info_read->channels){
+				sf_seek(fp_read, 0, SEEK_SET);
+				w_end_flg = true;
+			}
+		}
+
+		wpos = (wpos + 1) % NUM_BUFF;
+
+		return 0;
+	}
+
+	void writeBuff(){
+		while (1){
+			boost::mutex::scoped_lock lk(state_guard);
+
+			if (rpos != wpos && w_end_flg == false){
+				readData();
+			}
+			else if (w_end_flg == true && r_end_flg == true){
+				break;
+			}
+
+		}
+	}
+
+	int waitKey(){
+		getchar();
+
+		boost::mutex::scoped_lock lk(state_guard);
+		r_end_flg = true;
+		w_end_flg = true;
+
+		return 0;
+	}
+
+	void rposInc(){
+		boost::mutex::scoped_lock lk(state_guard);
+
+		rpos = (rpos + 1) % NUM_BUFF;
+
+		if (w_end_flg == true && wpos == rpos)
+			r_end_flg = true;
+	}
+
+	float* rposRtn(){
+		boost::mutex::scoped_lock lk(state_guard);
+		return streamBuff[rpos];
+	}
+
+};
+
+int paplayCallback(
+	const void *inputBuffer,
+	void *outputBuffer,
+	unsigned long framesPerBuffer,
+	const PaStreamCallbackTimeInfo* timeInfo,
+	PaStreamCallbackFlags statusFlags,
+	void *userData)
 {
-    SNDFILE *fp_write = NULL;
-    SF_INFO *sf_info_write = NULL;
-    CONSOLEAUDIOINFO *pstConsoleAudioInfo = (CONSOLEAUDIOINFO *)userData;
+	playStream *pstConsoleAudioInfo = (playStream *)userData;
 
-    sf_count_t count;
+	SF_INFO *sf_info_read = NULL;
+	sf_info_read = pstConsoleAudioInfo->sf_info_read;
 
-    fp_write = pstConsoleAudioInfo->fp_write;
-    sf_info_write = pstConsoleAudioInfo->sf_info_write;
+	memcpy(outputBuffer, pstConsoleAudioInfo->rposRtn(), framesPerBuffer*sf_info_read->channels*sizeof(float));
 
-    memcpy(pstConsoleAudioInfo->inbuff, (float *)inputBuffer, framesPerBuffer*(sf_info_write->channels)*sizeof(float));
+	pstConsoleAudioInfo->rposInc();
 
-    for(int i=0; i<(int)framesPerBuffer; i++)
-	    for(int j=0; j<sf_info_write->channels; j++)
-	      pstConsoleAudioInfo->outbuff[i*sf_info_write->channels+j] = pstConsoleAudioInfo->inbuff[i*sf_info_write->channels+j];
-
-    if(fp_write){
-	     count = sf_write_float(fp_write, pstConsoleAudioInfo->outbuff, framesPerBuffer *sf_info_write->channels);
-    }
-
-    return 0;
+	return 0;
 }
-
 
 int main(int argc, char** argv)
 {
-    SNDFILE *fp_write = NULL;
-    SF_INFO sf_info_write;
+	SNDFILE *fp_read = NULL;
+	SF_INFO sf_info_read;
+	sf_count_t count;
+	PaError err;
 
-    PaError err;
+	PaDeviceIndex nDevice;
+	PaDeviceIndex nDeviceID;
 
-    PaDeviceIndex nDevice;
-    PaDeviceIndex nDeviceID;
+	const PaDeviceInfo *pDeviceInfo = NULL;
+	const PaHostApiInfo *pHostApiInfo = NULL;
 
-    const PaDeviceInfo *pDeviceInfo;
-    const PaHostApiInfo *pHostApiInfo;
+	PaStream *pStream = NULL;
+	PaStreamParameters stInputParameters;
+	PaStreamParameters stOutputParameters;
 
-    PaStream *pStream = NULL;
-    PaStreamParameters stInputParameters;
-    PaStreamParameters stOutputParameters;
+	float **streamBuff;
 
-    CONSOLEAUDIOINFO stConsoleAudioInfo;
+	//int samplerate = 0;
+	//int channels = 0;
+	char *input = NULL;
+	float amp = 1.0;
 
-    float *inbuff;
-    float *outbuff;
+	/* Read options */
+	struct option options[] =
+	{
+		{"help", no_argument, 0, 'h'},
+		{"input", required_argument, 0, 'i'},
+		{"amp", required_argument, 0, 'a'},
+		{0, 0, 0, 0}
+	};
 
-    int samplerate = 0;
-    int channels = 0;
-    char *output = NULL;
-    float amp = 1.0;
+	int c;
+	int index;
 
-    struct option options[] =
-    {
-      {"help", 0, NULL, 'h'},
-	    {"output", 1, NULL, 'o'},
-	    {"amp", 2, NULL, 'a'},
-	    {"samplerate", 1, NULL, 's'},
-	    {"channels", 1, NULL, 'c'},
-	    {0, 0, 0, 0}
-	  };
+	while((c = getopt_long(argc, argv, "hi:a:", options, &index)) != -1){
+		switch(c){
+			case 'h':
+				usage();
+				exit(1);
+			case 'i':
+				input = optarg;
+				break;
+			case 'a':
+				amp = atof(optarg);
+				break;
+			default:
+				break;
+		}
+	}
 
-    int c;
-    int index;
+	if (!input){
+		fprintf(stderr, "ERROR : no input option\n");
+		usage();
+		exit(1);
+	}
 
-    while((c = getopt_long(argc, argv, "ho:a:s:c:", options, &index)) != -1){
-      switch(c){
-        case 'h':
-  				usage();
-  				exit(1);
-        case 'o':
-          output = optarg;
-	        break;
-	      case 'a':
-	        amp = atof(optarg);
-	        break;
-	      case 's':
-	        samplerate = atoi(optarg);
-	        break;
-	      case 'c':
-	        channels = atoi(optarg);
-	        break;
-	      default:
-	        break;
-	      }
-    }
+	memset(&sf_info_read, 0, sizeof(SF_INFO));
 
-    if(!output || !samplerate){
-	     fprintf(stderr, "ERROR : invalid arguments\n");
-	      usage();
-	      exit(1);
-    }
+	fp_read = sf_open(input, SFM_READ, &sf_info_read);
+	if (!fp_read){
+		printf("File Open Error!\n");
+		exit(1);
+	}
 
-    if(!channels){
-      channels = 1;
-    }
+	printf("Samplerate : %d\n", sf_info_read.samplerate);
+	printf("Channel : %d\n", sf_info_read.channels);
 
-    /* Read ini file*/
-  	boost::property_tree::ptree pt;
-  	read_ini(SETTING_INI, pt);
+	/* Read ini file*/
+	boost::property_tree::ptree pt;
+	read_ini(SETTING_INI, pt);
 
-  	char *audio_driver_name = NULL;
-  	int nFrameLength = 0;
+	char *audio_driver_name = NULL;
+	int nFrameLength = 0;
 
-  	if(boost::optional<string> driver_name = pt.get_optional<string>("audio.driver_name")) {
-  			audio_driver_name = (char *)driver_name.get().c_str();
-  			//printf("Audio driver name: %s\n", audio_driver_name);
+	if(boost::optional<string> driver_name = pt.get_optional<string>("audio.driver_name")) {
+			audio_driver_name = (char *)driver_name.get().c_str();
+			//printf("Audio driver name: %s\n", audio_driver_name);
 
-  	}
-  	else{
-  			fprintf(stderr, "Cannot find audio driver setting.\n");
-  			exit(1);
-  	}
+	}
+	else{
+			fprintf(stderr, "Cannot find audio driver setting.\n");
+			exit(1);
+	}
 
-  	if(boost::optional<int> frame_size = pt.get_optional<int>("audio.frame_size")) {
-  			nFrameLength = (int)frame_size.get();
-  			//printf("Frame size: %d\n", nFrameLength);
-  			if(nFrameLength>FRAME_SIZE_MAX || nFrameLength <= 0){
-  				fprintf(stderr, "Frame size setting is invalid.\n");
-  				exit(1);
-  			}
-  	}
-  	else{
-  			fprintf(stderr, "Cannot find frame size setting.\n");
-  			exit(1);
-  	}
+	if(boost::optional<int> frame_size = pt.get_optional<int>("audio.frame_size")) {
+			nFrameLength = (int)frame_size.get();
+			//printf("Frame size: %d\n", nFrameLength);
+			if(nFrameLength>FRAME_SIZE_MAX || nFrameLength <= 0){
+				fprintf(stderr, "Frame size setting is invalid.\n");
+				exit(1);
+			}
+	}
+	else{
+			fprintf(stderr, "Cannot find frame size setting.\n");
+			exit(1);
+	}
 
-    memset(&sf_info_write, 0, sizeof(SF_INFO));
+	/* Count Samples */
+	count = sf_seek(fp_read, 0, SEEK_END);
+	printf("Number of samples : %d\n", (int)count);
+	printf("Time [s] : %f\n", (double)count / sf_info_read.samplerate);
+	sf_seek(fp_read, 0, SEEK_SET);
 
-    sf_info_write.samplerate=samplerate;
-    sf_info_write.channels=channels;
-    sf_info_write.format=SF_FORMAT_WAV | SF_FORMAT_PCM_16;
+	err = Pa_Initialize();
+	if (err != paNoError){
+		fprintf(stderr, "Error : Pa_Initialize(), %s\n", Pa_GetErrorText(err));
+		exit(1);
+	}
 
-    fp_write = sf_open(output, SFM_WRITE, &sf_info_write);
-    if(!fp_write){
-	     printf("File Open Error!\n");
-	     exit(2);
-    }
+	/* Memory Allocation of Ring Buffer */
+	streamBuff = (float **)malloc(NUM_BUFF*sizeof(float *));
+	for (int i = 0; i<NUM_BUFF; i++){
+		streamBuff[i] = (float *)malloc(nFrameLength*sf_info_read.channels*sizeof(float));
+		memset(streamBuff[i], 0, nFrameLength*sf_info_read.channels*sizeof(float));
+	}
 
-    printf("Samplerate: %d\n", sf_info_write.samplerate);
-    printf("Channel: %d\n", sf_info_write.channels);
+	/* Select Audio Device */
+	nDevice = Pa_GetDeviceCount();
+	if (strcmp(audio_driver_name, "Default") == 0){
+		nDeviceID = Pa_GetDefaultOutputDevice();
+		pDeviceInfo = Pa_GetDeviceInfo(nDeviceID);
+	}
+	else{
+		for (nDeviceID = 0; nDeviceID<nDevice; nDeviceID++){
+			pDeviceInfo = Pa_GetDeviceInfo(nDeviceID);
+			if (strcmp(pDeviceInfo->name, audio_driver_name) == 0){
+				break;
+			}
+			if (nDeviceID == nDevice){
+				fprintf(stderr, "Error : Cannot find Audio Driver\n\t%s\n", audio_driver_name);
+				exit(1);
+			}
+		}
+	}
 
-    /* Memory Allocation of Buffer */
-    inbuff = (float *)malloc(nFrameLength*channels*sizeof(float));
-    memset(inbuff, 0, nFrameLength*channels*sizeof(float));
+	pHostApiInfo = Pa_GetHostApiInfo(pDeviceInfo->hostApi);
 
-    outbuff = (float *)malloc(nFrameLength*channels*sizeof(float));
-    memset(outbuff, 0, nFrameLength*channels*sizeof(float));
+	/* Information of  Audio Device */
+	printf("Audio driver: %s\n", pDeviceInfo->name);
+	//printf("\tapi name: %s\n", pHostApiInfo->name);
+	//printf("\tmax output channels: %d\n", pDeviceInfo->maxOutputChannels);
+	//printf("\tmax input channels: %d\n", pDeviceInfo->maxInputChannels);
 
-    err = Pa_Initialize();
-    if(err != paNoError){
-      fprintf(stderr, "Error : Pa_Initialize(), %s\n", Pa_GetErrorText(err));
-	    exit(1);
-    }
+	memset(&stInputParameters, 0, sizeof(PaStreamParameters));
+	memset(&stOutputParameters, 0, sizeof(PaStreamParameters));
 
-    /* Select Audio Device */
-    nDevice = Pa_GetDeviceCount();
-    if(strcmp(audio_driver_name, "Default")==0){
-      nDeviceID = Pa_GetDefaultOutputDevice();
-	    pDeviceInfo = Pa_GetDeviceInfo(nDeviceID);
-    }else{
-      for(nDeviceID = 0; nDeviceID<nDevice; nDeviceID++){
-         pDeviceInfo = Pa_GetDeviceInfo(nDeviceID);
-         if(strcmp(pDeviceInfo->name, audio_driver_name)==0){
-           break;
-         }
-         if(nDeviceID==nDevice){
-           fprintf(stderr, "Error : Cannot find Audio Driver\n\t%s\n",audio_driver_name);
-           exit(1);
-         }
-       }
-    }
+	stOutputParameters.channelCount = sf_info_read.channels;
+	stOutputParameters.device = nDeviceID;
+	stOutputParameters.sampleFormat = paFloat32;
 
-    pHostApiInfo = Pa_GetHostApiInfo(pDeviceInfo->hostApi);
+	playStream stConsoleAudioInfo(fp_read, &sf_info_read, nFrameLength, streamBuff, amp);
 
-    /* Information of  Audio Device */
-  	printf("Audio driver: %s\n", pDeviceInfo->name);
-  	//printf("\tapi name: %s\n", pHostApiInfo->name);
-  	//printf("\tmax output channels: %d\n", pDeviceInfo->maxOutputChannels);
-  	//printf("\tmax input channels: %d\n", pDeviceInfo->maxInputChannels);
+	boost::thread thr_writeBuff(boost::bind(&playStream::writeBuff, &stConsoleAudioInfo));
+	boost::thread thr_waitKey(boost::bind(&playStream::waitKey, &stConsoleAudioInfo));
 
-    memset(&stInputParameters, 0, sizeof(PaStreamParameters));
-    memset(&stOutputParameters, 0, sizeof(PaStreamParameters));
+	err = Pa_OpenStream(
+		&pStream,
+		NULL,
+		&stOutputParameters,
+		sf_info_read.samplerate,
+		nFrameLength,
+		paNoFlag,
+		paplayCallback,
+		&stConsoleAudioInfo);
 
-    stInputParameters.channelCount = channels;
-    stInputParameters.device = nDeviceID;
-    stInputParameters.sampleFormat = paFloat32;
+	if (err != paNoError){
+		fprintf(stderr, "Error : %s\n", Pa_GetErrorText(err));
+		Pa_Terminate();
+		exit(1);
+	}
 
-    memset(&stConsoleAudioInfo, 0, sizeof(CONSOLEAUDIOINFO));
-    stConsoleAudioInfo.fp_write = fp_write;
-    stConsoleAudioInfo.sf_info_write = &sf_info_write;
-    stConsoleAudioInfo.inbuff = inbuff;
-    stConsoleAudioInfo.outbuff = outbuff;
+	err = Pa_StartStream(pStream);
+	if (err != paNoError){
+		fprintf(stderr, "Error : %s\n", Pa_GetErrorText(err));
+	}
+	else{
+		fprintf(stderr, "Now playing...\n");
+		fprintf(stderr, "Press Enter key to stop stream.\n");
 
-    err = Pa_OpenStream(
-      &pStream,
-	    &stInputParameters,
-	    NULL,
-	    sf_info_write.samplerate,
-	    nFrameLength,
-	    paNoFlag,
-	    parecCallback,
-	    &stConsoleAudioInfo);
+		//wait
+		thr_writeBuff.join();
 
-    if(err != paNoError){
-      fprintf(stderr, "Error : %s\n", Pa_GetErrorText(err));
-	    Pa_Terminate();
-	    exit(1);
-    }
+		err = Pa_StopStream(pStream);
+		if (err != paNoError){
+			fprintf(stderr, "Error : %s\n", Pa_GetErrorText(err));
+		}
+	}
 
-    err = Pa_StartStream(pStream);
-    if(err != paNoError){
-      fprintf(stderr, "Error : %s\n", Pa_GetErrorText(err));}
-    else{
-      printf("Now recording...\n");
-	    printf("Press Enter key to stop stream...\n");
-      getchar();
+	err = Pa_Terminate();
+	if (err != paNoError){
+		fprintf(stderr, "Error : %s\n", Pa_GetErrorText(err));
+		exit(1);
+	}
 
-	    err = Pa_StopStream(pStream);
-	    if(err != paNoError){
-	       fprintf(stderr, "Error : %s\n", Pa_GetErrorText(err));
-	    }
-    }
+	if (fp_read){
+		sf_close(fp_read);
+		fp_read = NULL;
+	}
 
-    err = Pa_CloseStream(pStream);
-    if(err != paNoError){
-	     fprintf(stderr, "Error : %s\n", Pa_GetErrorText(err));
-    }
-
-    err = Pa_Terminate();
-    if(err != paNoError){
-	    fprintf(stderr, "Error : %s\n", Pa_GetErrorText(err));
-	    exit(1);
-    }
-
-    if(fp_write){
-	    sf_close(fp_write);
-	    fp_write=NULL;
-    }
-
-    return 0;
+	return 0;
 }
