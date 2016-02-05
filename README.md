@@ -1,7 +1,7 @@
 SNDtools
 ====
 ## Description
-CLI sound processing tools written by C++.
+CLI sound processing tools written in C++.
 
 ## Requirements
 - [boost](http://www.boost.org/)
