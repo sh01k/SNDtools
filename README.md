@@ -17,11 +17,11 @@ Simultaneously playback a wave file and record microphone inputs
 `playrec {-i/--input filename} {-o/--output filename} [-c/--channel number of input channels] [-a/--amp amplitude of output] [-h/--help]`
 
 ### play_multifilter
-playback a monaural wave file by multiple outputs with filtering  
+Playback a monaural wave file by multiple outputs with filtering  
 `play_multi_filter {-i/--input filename} {-f/--filter directory of filter files} [-o/--output number of output channels]  [-a/--amp amplitude] [-h/--help]`
 
 - Input wave file must be monaural.
-- The input file is convoluted by the filters in the filter directory, and these are output of each loudspeaker.
+- The input file is convoluted by the filters in the filter directory, which are outputs of loudspeakers.
 - Filter files must be put in the filter directory and their names must be [# of channel].bin, for example, 1.bin and 2.bin for ch1 and ch2, respectively.
 - The file format of the filter files is 64 bit binary (see a sample MATLAB code "filter_gen.m")
 - The number of filter files must be equal to or larger than the number of the output channels.  
